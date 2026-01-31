@@ -1,0 +1,248 @@
+
+"""
+Media fetcher module - v8.2 Stealth Edition
+Handles searching and downloading media from secret archives
+"""
+
+import os
+import logging
+import asyncio
+import aiohttp
+import aiofiles
+from typing import List, Dict, Any, Optional
+from app.config import Config
+config = Config()
+
+logger = logging.getLogger(__name__)
+
+# Download directory (temp). Use a writable path on Railway.
+# Defaults to /tmp to avoid filling the repo dir and to keep downloads ephemeral.
+DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "/tmp/downloads")
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+
+class MediaItem:
+    """Represents a media item"""
+    
+    def __init__(self, url: str, filename: str, media_type: str = "photo", post_id: str = None):
+        self.url = url
+        self.filename = filename
+        self.media_type = media_type  # photo or video
+        self.post_id = post_id
+        self.local_path: Optional[str] = None
+    
+    def __repr__(self):
+        return f"MediaItem(url={self.url}, type={self.media_type}, post={self.post_id})"
+
+
+class MediaFetcher:
+    """Fetches media from secret archives using validated APIs"""
+    
+    # Source URL hidden from logs and messages
+    BASE_URL = "https://coomer.st"
+    
+    def __init__(self):
+        self.session: Optional[aiohttp.ClientSession] = None
+        self.headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/css',
+        }
+        self._creators_cache = None
+    
+    async def __aenter__(self):
+        """Async context manager entry"""
+        self.session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=180),
+            headers=self.headers
+        )
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Async context manager exit"""
+        if self.session:
+            await self.session.close()
+
+    async def _get_creators_list(self) -> List[Dict]:
+        """Get and cache the full creators list"""
+        if self._creators_cache is not None:
+            return self._creators_cache
+        
+        try:
+            url = f"{self.BASE_URL}/api/v1/creators"
+            async with self.session.get(url) as response:
+                if response.status == 200:
+                    self._creators_cache = await response.json(content_type=None)
+                    logger.info(f"Syncing secret database...")
+                    return self._creators_cache
+        except Exception as e:
+            logger.error(f"Error syncing database: {e}")
+        
+        return []
+
+    async def find_all_matching_creators(self, model_name: str) -> List[Dict[str, Any]]:
+        """Find all creators matching the search term"""
+        creators = await self._get_creators_list()
+        if not creators:
+            return []
+        
+        import re
+        search_normalized = re.sub(r'[\s_-]+', '', model_name.lower().strip())
+        matches = []
+        
+        for creator in creators:
+            name = creator.get('name', '').lower()
+            name_normalized = re.sub(r'[\s_-]+', '', name)
+            
+            if (search_normalized == name_normalized or 
+                search_normalized in name_normalized or
+                name_normalized in search_normalized):
+                matches.append(creator)
+        
+        matches.sort(key=lambda c: len(c.get('name', '')))
+        return matches[:10]
+
+    async def fetch_posts_page(self, creator: Dict[str, Any], offset: int = 0) -> Dict[str, Any]:
+        """Fetch a single *posts* page.
+
+        The upstream API paginates by POSTS ("o" is an offset in posts), but each post can contain
+        multiple media files (main file + attachments). Some earlier versions incorrectly advanced
+        the offset by the number of media items, which can cause premature "end" pages.
+
+        Returns a dict with:
+          - posts: raw posts list
+          - media_items: flattened List[MediaItem]
+        """
+        media_items: List[MediaItem] = []
+        posts: List[Dict[str, Any]] = []
+        service = creator.get('service')
+        creator_id = creator.get('id')
+        
+        if not service or not creator_id:
+            return {"posts": [], "media_items": []}
+        
+        try:
+            posts_url = f"{self.BASE_URL}/api/v1/{service}/user/{creator_id}/posts?o={offset}"
+            async with self.session.get(posts_url) as response:
+                if response.status != 200:
+                    return {"posts": [], "media_items": []}
+                
+                posts = await response.json(content_type=None)
+                if not isinstance(posts, list):
+                    return {"posts": [], "media_items": []}
+                
+                for post in posts:
+                    post_id = post.get('id')
+                    file_info = post.get('file', {})
+                    if file_info and file_info.get('path'):
+                        path = file_info['path']
+                        media_url = f"{self.BASE_URL}/data{path}"
+                        filename = file_info.get('name') or f"{post_id}_main"
+                        ext = path.lower().split('.')[-1] if '.' in path else ''
+                        media_type = "video" if ext in ['mp4', 'm4v', 'mov', 'webm', 'avi'] else "photo"
+                        media_items.append(MediaItem(media_url, filename, media_type, str(post_id)))
+                    
+                    for i, attachment in enumerate(post.get('attachments', [])):
+                        if attachment.get('path'):
+                            path = attachment['path']
+                            media_url = f"{self.BASE_URL}/data{path}"
+                            filename = attachment.get('name') or f"{post_id}_att{i}"
+                            ext = path.lower().split('.')[-1] if '.' in path else ''
+                            media_type = "video" if ext in ['mp4', 'm4v', 'mov', 'webm', 'avi'] else "photo"
+                            media_items.append(MediaItem(media_url, filename, media_type, str(post_id)))
+        except Exception:
+            # keep the fetcher silent; the caller handles empty pages
+            return {"posts": [], "media_items": []}
+
+        return {"posts": posts, "media_items": media_items}
+
+    async def fetch_posts_paged(self, creator: Dict[str, Any], offset: int = 0) -> List[MediaItem]:
+        """Backward-compatible wrapper that returns only the flattened media list."""
+        result = await self.fetch_posts_page(creator, offset=offset)
+        return result.get("media_items", [])
+
+    async def download_media(self, item: MediaItem) -> bool:
+        """Download media to local storage.
+
+        Guardrails to avoid "travar" (hanging) for the user:
+        - Streams in chunks (no full read into memory)
+        - Enforces a max size (TELEGRAM_MAX_UPLOAD_MB) and aborts early
+        - Deletes and skips empty downloads
+        """
+        if not self.session:
+            return False
+            
+        ext = item.url.split('.')[-1].split('?')[0]
+        local_filename = f"{item.post_id}_{item.filename}"
+        if not local_filename.endswith(f".{ext}"):
+            local_filename += f".{ext}"
+            
+        local_path = os.path.join(DOWNLOAD_DIR, local_filename)
+        
+        # Max size enforced during download (default safe for bots)
+        try:
+            max_mb = float(os.getenv("TELEGRAM_MAX_UPLOAD_MB", "49"))
+        except Exception:
+            max_mb = 49.0
+        max_bytes = int(max_mb * 1024 * 1024)
+
+        try:
+            # Separate connect/read timeouts to fail fast on bad/slow links
+            timeout = aiohttp.ClientTimeout(total=180, sock_connect=15, sock_read=30)
+            async with self.session.get(item.url, timeout=timeout) as response:
+                if response.status != 200:
+                    return False
+
+                # If server provides size, skip early
+                cl = response.headers.get("Content-Length")
+                if cl:
+                    try:
+                        if int(cl) > max_bytes:
+                            logger.warning("Skipping oversized remote file (Content-Length > limit)")
+                            return False
+                    except Exception:
+                        pass
+
+                written = 0
+                async with aiofiles.open(local_path, mode="wb") as f:
+                    async for chunk in response.content.iter_chunked(256 * 1024):
+                        if not chunk:
+                            continue
+                        written += len(chunk)
+                        if written > max_bytes:
+                            # Abort oversized downloads ASAP
+                            await f.close()
+                            try:
+                                os.remove(local_path)
+                            except Exception:
+                                pass
+                            logger.warning("Aborted download: file exceeded max upload size")
+                            return False
+                        await f.write(chunk)
+
+                # Skip empty files
+                if written == 0:
+                    try:
+                        os.remove(local_path)
+                    except Exception:
+                        pass
+                    logger.warning("Downloaded empty file; skipping")
+                    return False
+
+                item.local_path = local_path
+                return True
+
+        except asyncio.TimeoutError:
+            logger.warning("Download timed out; skipping item")
+            try:
+                if os.path.exists(local_path):
+                    os.remove(local_path)
+            except Exception:
+                pass
+            return False
+        except Exception:
+            try:
+                if os.path.exists(local_path):
+                    os.remove(local_path)
+            except Exception:
+                pass
+            return False
